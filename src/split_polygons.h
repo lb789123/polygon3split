@@ -25,8 +25,12 @@
 #include <CGAL/Polygon_mesh_processing/internal/Corefinement/face_graph_utils.h> // Default_visitor
 #include <CGAL/boost/graph/helpers.h>                          // is_valid_polygon_mesh
 #include <CGAL/boost/graph/iterator.h>                         // halfedges_around_face
+#include <CGAL/number_utils.h>                                // to_double(OBJ 导出)
 
 #include <cstddef>
+#include <cstdlib>      // getenv(调试导出开关)
+#include <filesystem>   // create_directories(调试导出目录)
+#include <fstream>      // 调试 OBJ 导出
 #include <string>
 #include <utility>
 #include <vector>
@@ -201,6 +205,100 @@ std::vector<std::string> preflight_check(const Polygon_mesh<K>& tm,
   return problems;
 }
 
+// ── 调试:分阶段 OBJ 导出(可选)────────────────────────────────────────
+// split_mesh 内设置环境变量 POLYGON3SPLIT_DEBUG_DIR(输出目录)后,每次调用
+// 写出一组 .obj,逐阶段人工检查(Blender / MeshLab 可直接打开):
+//   <call>_00_tm_input.obj          建面后的 tm(三角化前,可能含多边形面)
+//   <call>_01_tm_triangulated.obj   ② 之后(全三角,每面注释来源编号)
+//   <call>_02_splitter.obj          ④ 实际消费的折面副本(已三角化)
+//   <call>_03_tm_after_split.obj    ④+⑤ 之后(已撕开,每面注释 来源/片号)
+//   <call>_04_pieces.obj            ⑥ 各片边界环(每片一个多边形)
+// 坐标统一 CGAL::to_double;OBJ 行用 CRLF。未设置环境变量则零开销不输出。
+template <class Mesh, class FaceNote>
+void write_mesh_obj(const Mesh& mesh,
+                    const std::string& file_path,
+                    const FaceNote& face_note)
+{
+    std::ofstream out(file_path, std::ios::binary);
+    if (!out)
+    {
+        return;
+    }
+    auto emit_line = [&out](const std::string& text)
+    {
+        out << text << "\r\n";
+    };
+
+    auto vpm = get(CGAL::vertex_point, mesh);
+    for (auto v : vertices(mesh))
+    {
+        const auto& p = get(vpm, v);
+        emit_line("v " + std::to_string(CGAL::to_double(p.x())) + " " +
+                  std::to_string(CGAL::to_double(p.y())) + " " +
+                  std::to_string(CGAL::to_double(p.z())));
+    }
+    for (auto f : faces(mesh))
+    {
+        std::string line = "f";
+        for (auto h : halfedges_around_face(halfedge(f, mesh), mesh))
+        {
+            line += " " + std::to_string(target(h, mesh).idx() + 1);
+        }
+        const std::string note = face_note(f);
+        if (!note.empty())
+        {
+            line += "  # " + note;
+        }
+        emit_line(line);
+    }
+}
+
+// 不带每面注释的导出(仅顶点 + 面)
+template <class Mesh>
+void write_mesh_obj(const Mesh& mesh, const std::string& file_path)
+{
+    write_mesh_obj(mesh, file_path,
+                   [](const typename boost::graph_traits<Mesh>::face_descriptor&)
+                   {
+                       return std::string();
+                   });
+}
+
+// 各片边界环导出:每片 = 一个 OBJ 组 + 一个多边形面,注释标明来源/片号
+template <class Result>
+void write_pieces_obj(const Result& result, const std::string& file_path)
+{
+    std::ofstream out(file_path, std::ios::binary);
+    if (!out)
+    {
+        return;
+    }
+    auto emit_line = [&out](const std::string& text)
+    {
+        out << text << "\r\n";
+    };
+
+    std::size_t vertex_offset = 0;
+    for (const auto& pc : result.pieces)
+    {
+        emit_line("g source_" + std::to_string(pc.source) + "_piece_" +
+                  std::to_string(pc.piece));
+        for (const auto& p : pc.ring)
+        {
+            emit_line("v " + std::to_string(CGAL::to_double(p.x())) + " " +
+                      std::to_string(CGAL::to_double(p.y())) + " " +
+                      std::to_string(CGAL::to_double(p.z())));
+        }
+        std::string line = "f";
+        for (std::size_t i = 1; i <= pc.ring.size(); ++i)
+        {
+            line += " " + std::to_string(vertex_offset + i);
+        }
+        emit_line(line + "  # ring_size=" + std::to_string(pc.ring.size()));
+        vertex_offset += pc.ring.size();
+    }
+}
+
 // ── 核心:标记 → 切割 → 分组 → 取环 ────────────────────────────────────
 // tm 按值传入(函数内修改);splitter 传常引用,内部复制(split 会细化 splitter 副本)。
 // 前提:tm 各面为简单多边形环(可非凸),每个原始面 = 一个输入多边形(相邻多边形
@@ -213,6 +311,20 @@ Split_result<K> split_mesh(Polygon_mesh<K> tm, const Polygon_mesh<K>& splitter)
   typedef typename Mesh::Edge_index     Edge_index;
   typedef typename Mesh::Halfedge_index halfedge_descriptor;
 
+  // 调试导出开关:环境变量 POLYGON3SPLIT_DEBUG_DIR 指向输出目录,非空才写 OBJ
+  const char* const DEBUG_DIR_ENV_VAR = "POLYGON3SPLIT_DEBUG_DIR";
+  const char* debug_dir_env = std::getenv(DEBUG_DIR_ENV_VAR);
+  const bool dump_debug_obj = (debug_dir_env != nullptr && debug_dir_env[0] != '\0');
+  static std::size_t debug_call_seq = 0;
+  std::string debug_prefix;
+  if (dump_debug_obj)
+  {
+    std::filesystem::create_directories(debug_dir_env);
+    debug_prefix = std::string(debug_dir_env) + "/" +
+                   std::to_string(debug_call_seq++) + "_";
+    write_mesh_obj(tm, debug_prefix + "00_tm_input.obj");
+  }
+
   // ② 来源标记 + 三角化:先给每个原始面写自己的面号(= 多边形号),再用带
   //    visitor 的 triangulate_faces 三角化 —— 每个新三角形继承所在原始面的来源。
   //    (不用"先三角化再连通分量记来源":相邻多边形共边会并成一个分量。)
@@ -223,12 +335,23 @@ Split_result<K> split_mesh(Polygon_mesh<K> tm, const Polygon_mesh<K>& splitter)
   }
   PMP::triangulate_faces(tm,
       PMP::parameters::visitor(Tri_source_tagger<decltype(fid), Mesh>(fid)));
+  if (dump_debug_obj)
+  {
+    write_mesh_obj(tm, debug_prefix + "01_tm_triangulated.obj", [&](Face_index f)
+    {
+      return "source=" + std::to_string(get(fid, f));
+    });
+  }
 
   // ④ 切割 + 标记传播
   //    注:两网格 split() 不消费 throw_on_self_intersection(clip.h:1325-1347 未提取、
   //    未转发给 corefine),故不传;visitor 的工厂/链式写法依据 clip.h:1346。
   Tag_propagator<decltype(fid), Mesh> tagger(fid, tm);   // 守卫:只传播 tm 的标记
   Mesh splitter_copy(splitter);
+  if (dump_debug_obj)
+  {
+    write_mesh_obj(splitter_copy, debug_prefix + "02_splitter.obj");
+  }
   PMP::split(tm, splitter_copy,
              CGAL::parameters::vertex_point_map(get(CGAL::vertex_point, tm))
                               .visitor(tagger));
@@ -252,6 +375,14 @@ Split_result<K> split_mesh(Polygon_mesh<K> tm, const Polygon_mesh<K>& splitter)
   }
   result.component_count =
       PMP::connected_components(tm, pid, PMP::parameters::edge_is_constrained_map(ecm));
+  if (dump_debug_obj)
+  {
+    write_mesh_obj(tm, debug_prefix + "03_tm_after_split.obj", [&](Face_index f)
+    {
+      return "source=" + std::to_string(get(fid, f)) +
+             " piece=" + std::to_string(get(pid, f));
+    });
+  }
 
   // ⑥ 组边界环:半边 h 是组 g 的边界半边 ⟺ face(h) ∈ g 且(对侧无面[撕开边/网格
   //    外边界] 或 对侧面组号 ≠ g[相邻多边形共享边])。
@@ -292,6 +423,11 @@ Split_result<K> split_mesh(Polygon_mesh<K> tm, const Polygon_mesh<K>& splitter)
       cur = next_border(cur, grp);
     } while (cur != h);
     result.pieces.push_back(std::move(pc));
+  }
+
+  if (dump_debug_obj)
+  {
+    write_pieces_obj(result, debug_prefix + "04_pieces.obj");
   }
 
   result.mesh = std::move(tm);
