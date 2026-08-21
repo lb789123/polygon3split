@@ -2,8 +2,10 @@
 //
 // 设计/验证文档:docs/polygon-split-by-folded-surface.md
 // 核心链路:①建面(每个原始面 = 一个多边形,相邻多边形共享顶点/边)
-//           → ②triangulate_faces + visitor 逐面标记来源(禁用连通分量记来源:
-//             相邻多边形有共用边,会并成一个分量,来源信息丢失)
+//           → ②三角化 + 逐面标记来源:≥5 顶点面走本文件的平面化 CDT
+//             (triangulate_polygon_faces,PMP 洞填充路径对不共面环有缺陷,
+//             见该函数注释);quad 交 PMP::triangulate_faces 精确路径 + visitor
+//             (禁用连通分量记来源:相邻多边形有共用边,会并成一个分量)
 //           → ④PMP::split + visitor 标记传播
 //           → ⑤连通分组:以"两侧来源不同的边"为 barrier 求连通分量
 //             → pid = (来源多边形 × 切割片) 组号,每个多边形各自分成多片
@@ -26,11 +28,19 @@
 #include <CGAL/boost/graph/helpers.h>                          // is_valid_polygon_mesh
 #include <CGAL/boost/graph/iterator.h>                         // halfedges_around_face
 #include <CGAL/number_utils.h>                                // to_double(OBJ 导出)
+#include <CGAL/Constrained_Delaunay_triangulation_2.h>         // ≥5 边形平面化 CDT
+#include <CGAL/Constrained_triangulation_face_base_2.h>
+#include <CGAL/Projection_traits_3.h>
+#include <CGAL/Triangulation_face_base_with_info_2.h>
+#include <CGAL/Triangulation_vertex_base_with_info_2.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdlib>      // getenv(调试导出开关)
 #include <filesystem>   // create_directories(调试导出目录)
 #include <fstream>      // 调试 OBJ 导出
+#include <queue>        // CDT 外域洪泛
+#include <stdexcept>    // invalid_argument
 #include <string>
 #include <utility>
 #include <vector>
@@ -133,14 +143,198 @@ Polygon_mesh<K> build_mesh(const std::vector<std::vector<typename K::Point_3>>& 
   return m;
 }
 
+// ── 单环平面化 CDT:Newell 法向投影 + 精确 2D 约束 Delaunay ─────────────
+// 环顶点 → n-2 个(环下标)三角形,朝向与环一致;失败返回空。
+// 失败 = 环去重后 <5 点(本函数只服务 ≥5;3/4 交还 PMP 的精确路径)、
+//        Newell 法向为零(整环共线/退化)、投影后自交(constraint 相交异常)、
+//        CDT 退化(维度 <2)或域内三角形投影共线。
+template <class K>
+std::vector<std::array<std::size_t, 3>>
+planar_cdt_ring(const std::vector<typename K::Point_3>& ring)
+{
+  typedef CGAL::Projection_traits_3<K>                                 PT;
+  typedef CGAL::Triangulation_vertex_base_with_info_2<std::size_t, PT> Vb;
+  typedef CGAL::Triangulation_face_base_with_info_2<bool, PT>          Fbi;
+  typedef CGAL::Constrained_triangulation_face_base_2<PT, Fbi>         Fb;
+  typedef CGAL::Triangulation_data_structure_2<Vb, Fb>                 TDS;
+  // 环是简单环(投影后不交叉)→ 约束不会相交,可用免相交检查的快速 tag
+  typedef CGAL::Constrained_Delaunay_triangulation_2<PT, TDS,
+          CGAL::No_constraint_intersection_tag>                        CDT;
+  typedef typename K::Vector_3                                         V3;
+
+  const std::size_t n = ring.size();
+  if (n < 5) return {};
+
+  // Newell 法向 = Σ p_i × p_{i+1}(精确;近平面简单环 = 2×矢量面积,恒非零)
+  V3 N(0, 0, 0);
+  for (std::size_t i = 0; i < n; ++i) {
+    const auto& a = ring[i];
+    const auto& b = ring[(i + 1) % n];
+    N = N + V3(a.y() * b.z() - a.z() * b.y(),
+               a.z() * b.x() - a.x() * b.z(),
+               a.x() * b.y() - a.y() * b.x());
+  }
+  if (N == CGAL::NULL_VECTOR) return {};
+
+  PT traits(N);
+  CDT cdt(traits);
+  std::vector<std::pair<typename K::Point_3, std::size_t>> pts;
+  pts.reserve(n);
+  for (std::size_t i = 0; i < n; ++i) pts.emplace_back(ring[i], i);
+  cdt.insert(pts.begin(), pts.end());
+  std::vector<typename CDT::Vertex_handle> vh(n);
+  for (auto v : cdt.finite_vertex_handles()) vh[v->info()] = v;
+  if (cdt.number_of_vertices() != n) return {};   // 有点被合并(重复点;调用方已去重)
+  try {
+    for (std::size_t i = 0; i < n; ++i)
+      if (vh[i] != vh[(i + 1) % n])
+        cdt.insert_constraint(vh[i], vh[(i + 1) % n]);
+  } catch (const typename CDT::Intersection_of_constraints_exception&) {
+    return {};                                     // 投影后自交
+  }
+  if (cdt.dimension() != 2) return {};             // 全共线等退化
+
+  // 外域洪泛标记:自无限面起跨非约束边扩散,余下的有限面即多边形域内
+  for (auto fit = cdt.all_faces_begin(); fit != cdt.all_faces_end(); ++fit)
+    fit->info() = false;
+  std::queue<typename CDT::Face_handle> fq;
+  fq.push(cdt.infinite_vertex()->face());
+  while (!fq.empty()) {
+    auto fh = fq.front();
+    fq.pop();
+    if (fh->info()) continue;
+    fh->info() = true;
+    for (int i = 0; i < 3; ++i)
+      if (!cdt.is_constrained(typename CDT::Edge(fh, i)))
+        fq.push(fh->neighbor(i));
+  }
+
+  // 域内三角形,朝向统一为与 Newell 法向成右手系(与环旋向一致)
+  std::vector<std::array<std::size_t, 3>> tris;
+  for (auto fit = cdt.finite_faces_begin(); fit != cdt.finite_faces_end(); ++fit) {
+    if (fit->info()) continue;                     // 外域
+    const std::size_t a = fit->vertex(0)->info();
+    const std::size_t b = fit->vertex(1)->info();
+    const std::size_t c = fit->vertex(2)->info();
+    const V3 t = CGAL::cross_product(ring[b] - ring[a], ring[c] - ring[a]);
+    if (t * N == 0) return {};                     // 域内投影退化
+    tris.push_back(t * N > 0 ? std::array<std::size_t, 3>{a, b, c}
+                             : std::array<std::size_t, 3>{a, c, b});
+  }
+  if (tris.size() != n - 2) return {};             // 无洞简单环必须恰为 n-2 片
+  return tris;
+}
+
+// ── ≥5 顶点面的平面化三角化(② 的前置步骤)──────────────────────────────
+// 为什么不把 ≥5 顶点面直接交给 PMP::triangulate_faces:它走洞填充路径
+// (triangulate_faces.h:328 → triangulate_hole_polyline),其平面 CDT 子路径的
+// 共面闸门以 bbox 的 **z 跨度** 为容差基准 —— triangulate_hole.h:769-771 取
+// vertex(0)-vertex(5) 的平方距离,而在 CGAL 6.2 的 Iso_cuboid_3 顶点序里这两点
+// 仅相差 z(实测确认)。于是近似水平的多边形(z 跨度≈0,平面数据最常见形态)
+// 容差≈0:EPECK 下哪怕 1e-17 的不共面都会被拒,然后【静默】回退到 3D Delaunay
+// 洞填充(use_delaunay_triangulation 默认开)—— 那是给曲面洞补片设计的最小
+// 二面角搜索,在近平面点集上三角形质量失控(对角线乱穿,视觉即"乱七八糟"),
+// 大环更是 O(n³)。另实测:PMP 路径遇环上连续重复顶点会静默不三角化(非三角
+// 面直接进 split,未定义行为)。
+//
+// 本函数做真正的"3D 多边形三角化"(对不共面环 = 投影到 Newell 平面后做平面
+// 三角化,割耳思路的 Delaunay 版,三角形质量更优):对每个 ≥5 顶点的面
+// (先去连续重复点),在 Newell 法向投影下建精确 2D 约束 Delaunay(PMP 平面
+// 子路径同款机制,但无共面闸门),三角形朝向与环一致。3/4 顶点面原样保留:
+// PMP 的 quad 路径(triangulate_faces.h:240-324)纯精确算术、无平面性前提、
+// 对角线选择最优,继续交给它。输入多边形允许不共面(严格或近似)。
+//
+// 返回:重建后网格的面按原面分组(groups[k] = 原面 k 拆出的新面,顺序与
+// 原面一致);任一环退化时返回【空 vector】且 m 原样不动(全或无)。
+// 重建逐顶点复制:相邻多边形的共享顶点/边照常保留,add_face 自动缝合。
+template <class K>
+std::vector<std::vector<typename Polygon_mesh<K>::Face_index>>
+triangulate_polygon_faces(Polygon_mesh<K>& m)
+{
+  typedef Polygon_mesh<K>               Mesh;
+  typedef typename Mesh::Vertex_index   Vertex_index;
+  typedef typename Mesh::Face_index     Face_index;
+  typedef typename K::Point_3           Point_3;
+
+  // 1. 采集原面环(顶点描述符 + 点),去连续重复点(含首尾相接处)
+  auto vpm = get(CGAL::vertex_point, m);
+  std::vector<std::vector<Vertex_index>> rings_v;
+  std::vector<std::vector<Point_3>>      rings_p;
+  for (auto f : faces(m)) {
+    std::vector<Vertex_index> rv;
+    std::vector<Point_3>      rp;
+    for (auto h : halfedges_around_face(halfedge(f, m), m)) {
+      auto v = target(h, m);
+      if (rp.empty() || rp.back() != get(vpm, v)) {
+        rv.push_back(v);
+        rp.push_back(get(vpm, v));
+      }
+    }
+    while (rp.size() > 1 && rp.front() == rp.back()) { rv.pop_back(); rp.pop_back(); }
+    rings_v.push_back(std::move(rv));
+    rings_p.push_back(std::move(rp));
+  }
+
+  // 2. ≥5 顶点环:平面化 CDT(任一失败 → 全或无,不动 m)
+  std::vector<std::vector<std::array<std::size_t, 3>>> tris;
+  for (const auto& rp : rings_p) {
+    if (rp.size() >= 5) {
+      auto t = planar_cdt_ring<K>(rp);
+      if (t.empty()) return {};
+      tris.push_back(std::move(t));
+    } else {
+      if (rp.size() < 3) return {};                // 去重后退化(<3 点不成面)
+      tris.emplace_back();                         // 3/4 顶点:原样保留
+    }
+  }
+
+  // 3. 重建:逐顶点复制(保留共享),逐原面加面(≥5:三角形;3/4:原环面)
+  Mesh out;
+  std::size_t max_vi = 1;
+  for (auto v : vertices(m)) {
+    const std::size_t i = v.idx() + 1;             // 去重后可能有编号空洞
+    if (i > max_vi) max_vi = i;
+  }
+  std::vector<Vertex_index> nv(max_vi);
+  for (auto v : vertices(m)) nv[v.idx()] = out.add_vertex(get(vpm, v));
+
+  std::vector<std::vector<Face_index>> groups;
+  for (std::size_t k = 0; k < rings_v.size(); ++k) {
+    std::vector<Face_index> g;
+    if (rings_p[k].size() >= 5) {
+      g.reserve(tris[k].size());
+      for (const auto& t : tris[k]) {
+        auto f = out.add_face(nv[rings_v[k][t[0]].idx()],
+                              nv[rings_v[k][t[1]].idx()],
+                              nv[rings_v[k][t[2]].idx()]);
+        if (f == Mesh::null_face()) return {};     // 非流形/退化 → 全或无
+        g.push_back(f);
+      }
+    } else {
+      std::vector<Vertex_index> fv;
+      for (auto v : rings_v[k]) fv.push_back(nv[v.idx()]);
+      auto f = out.add_face(fv);
+      if (f == Mesh::null_face()) return {};
+      g.push_back(f);
+    }
+    groups.push_back(std::move(g));
+  }
+  m = std::move(out);
+  return groups;
+}
+
 // 折面建 splitter:若干平面片(点列环)→ 建面 + 三角化。
-// 前提(文档③):无自交、完全横跨被切多边形(建议向四周延伸出包围盒)。
-// 需要共享边的折面(如 V 形两坡共屋脊)请自行建面共享顶点,再手动 triangulate_faces。
+// 需要共享边的折面(如 V 形两坡共屋脊)请自行建面共享顶点,再手动
+// triangulate_polygon_faces + PMP::triangulate_faces(与管线②一致)。
 template <class K>
 Polygon_mesh<K> build_splitter(const std::vector<std::vector<typename K::Point_3>>& patches)
 {
   auto s = build_mesh<K>(patches);
-  PMP::triangulate_faces(s);
+  const std::size_t n_faces = s.number_of_faces();
+  if (triangulate_polygon_faces<K>(s).size() != n_faces)
+    throw std::invalid_argument(
+        "build_splitter: 折面片无法三角化(≥5 顶点且退化,或投影后自交)");
+  PMP::triangulate_faces(s);   // quad 路径收尾
   return s;
 }
 
@@ -188,7 +382,10 @@ std::vector<std::string> preflight_check(const Polygon_mesh<K>& tm,
     problems.push_back("tm: 网格结构非法");
   else {
     Mesh tm_copy(tm);                       // 与管线同路径:先三角化再体检
-    PMP::triangulate_faces(tm_copy);
+    const std::size_t n_faces = tm_copy.number_of_faces();
+    if (triangulate_polygon_faces<K>(tm_copy).size() != n_faces)
+      problems.push_back("tm: 存在无法平面化三角化的 ≥5 顶点面(退化或投影自交)");
+    PMP::triangulate_faces(tm_copy);        // quad 路径收尾
     if (!all_triangles(tm_copy))
       problems.push_back("tm: 存在无法三角化的面(顶点共线等退化环)");
     else
@@ -325,14 +522,20 @@ Split_result<K> split_mesh(Polygon_mesh<K> tm, const Polygon_mesh<K>& splitter)
     write_mesh_obj(tm, debug_prefix + "00_tm_input.obj");
   }
 
-  // ② 来源标记 + 三角化:先给每个原始面写自己的面号(= 多边形号),再用带
-  //    visitor 的 triangulate_faces 三角化 —— 每个新三角形继承所在原始面的来源。
+  // ② 来源标记 + 三角化:≥5 顶点面先走平面化 CDT(triangulate_polygon_faces,
+  //    见其注释:PMP 洞填充路径对不共面环会静默回退 3D Delaunay、质量失控),
+  //    新三角形直接按分组写来源;剩余 quad 交给 PMP::triangulate_faces 的精确
+  //    专用路径 + visitor 继承来源。
   //    (不用"先三角化再连通分量记来源":相邻多边形共边会并成一个分量。)
+  const std::size_t n_orig_faces = tm.number_of_faces();
+  auto groups = triangulate_polygon_faces<K>(tm);
+  if (groups.size() != n_orig_faces)
+    throw std::invalid_argument(
+        "split_mesh: 存在无法三角化的多边形面(≥5 顶点且退化,或投影后自交)");
   auto fid = tm.add_property_map<Face_index, int>("f:source", -1).first;
-  {
-    std::size_t poly_id = 0;
-    for (auto f : faces(tm)) put(fid, f, static_cast<int>(poly_id++));
-  }
+  for (std::size_t poly_id = 0; poly_id < groups.size(); ++poly_id)
+    for (auto f : groups[poly_id])
+      put(fid, f, static_cast<int>(poly_id));
   PMP::triangulate_faces(tm,
       PMP::parameters::visitor(Tri_source_tagger<decltype(fid), Mesh>(fid)));
   if (dump_debug_obj)

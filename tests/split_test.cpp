@@ -1,5 +1,6 @@
 // split_test.cpp —— 验证 docs/polygon-split-by-folded-surface.md 的全部 [推断]/[未验证] 论断
-// 六个用例,期望值全部可手算(文档第 8 节)。任一 CHECK 失败即回溯对应论断。
+// 用例 1-7 期望值全部可手算(文档第 8 节);8-10 是 ≥5 顶点多边形面三角化的回归
+// (非平面 / 强非凸 / 重复连续顶点)。任一 CHECK 失败即回溯对应论断。
 //
 // 通过标准:全部 CHECK 通过;result.mesh 通过 is_valid_polygon_mesh;
 //           component_count == pieces.size();unmarked_faces == 0。
@@ -107,16 +108,18 @@ static void report(const char* name, poly_split::Split_result<K>& r)
   CHECK(CGAL::is_valid_polygon_mesh(r.mesh), "撕开后 mesh 不合法");
 }
 
-// 期望环集合匹配:每个期望环恰好匹配一个实际片(顺序无关)
+// 期望环集合匹配:每个期望环恰好匹配一个实际片(顺序无关)。
+// tol:噪声用例(顶点 z≈1e-9 微离面)放宽到 1e-7。
 static void check_rings(const std::vector<std::vector<DPoint>>& expected,
-                        const std::vector<poly_split::PolygonPiece<K>>& pieces)
+                        const std::vector<poly_split::PolygonPiece<K>>& pieces,
+                        double tol = 1e-12)
 {
   CHECK(expected.size() == pieces.size(), "片数不符");
   std::vector<bool> used(pieces.size(), false);
   for (const auto& exp : expected) {
     bool found = false;
     for (std::size_t i = 0; i < pieces.size(); ++i) {
-      if (!used[i] && ring_match(exp, pieces[i].ring)) { used[i] = true; found = true; break; }
+      if (!used[i] && ring_match(exp, pieces[i].ring, tol)) { used[i] = true; found = true; break; }
     }
     CHECK(found, "未找到期望环(" + str(exp.front()) + " ...)");
   }
@@ -367,6 +370,74 @@ static void test7()
   }
 }
 
+// ── 测试 8:非平面 ≥5 边形(L 形六边形,凹点 z=1e-9)─────────────────────
+// 回归:PMP::triangulate_faces 的 ≥5 顶点洞填充路径对此类输入会静默回退
+// 3D Delaunay 洞填充(triangulate_hole.h:769-771 的共面容差 = bbox z 跨度²/16,
+// 近水平多边形容差≈0)→ 三角形乱穿。管线②现改走 triangulate_polygon_faces
+// 的平面化 CDT。切割几何与严格平面版完全一致:竖墙 x=1 切 L((0,0),(2,0),
+// (2,1),(0.7,1),(0.7,2),(0,2)) 成右四边形 + 左六边形;噪声顶点出现在左片环里
+// (z≈1e-9,环比较容差放宽到 1e-7)。
+static void test8()
+{
+  const std::vector<std::vector<DPoint>> expect = {
+    { P2(1,0), P2(2,0), P2(2,1), P2(1,1) },                                  // 右片
+    { P2(1,0), P2(1,1), P2(0.7,1), P2(0.7,2), P2(0,2), P2(0,0) },            // 左片
+  };
+  {
+    auto r = poly_split::split_polygons<K>(
+      { { P(0,0,0), P(2,0,0), P(2,1,0), P(0.7,1,0), P(0.7,2,0), P(0,2,0) } },
+      make_wall_splitter(1));
+    report("test8 planar L-hexagon (>=5 vertices)", r);
+    CHECK(r.pieces.size() == 2, "应得 2 片");
+    check_rings(expect, r.pieces);
+  }
+  {
+    auto r = poly_split::split_polygons<K>(
+      { { P(0,0,0), P(2,0,0), P(2,1,0), P(0.7,1,1e-9), P(0.7,2,0), P(0,2,0) } },
+      make_wall_splitter(1));
+    report("test8 non-planar L-hexagon (reflex vertex z=1e-9)", r);
+    CHECK(r.pieces.size() == 2, "应得 2 片(与平面版一致)");
+    check_rings(expect, r.pieces, /*tol=*/1e-7);   // 噪声顶点 z≈1e-9 放宽
+  }
+}
+
+// ── 测试 9:强非凸 C 形八边形(带噪声)切三片 ───────────────────────────
+// 竖墙 x=1 过 C 形缺口:上下两横条各被切,右柱连通 → 左下/右侧连通/左上三片。
+// 8 顶点 ≥5,凹角点 (2.5,2.5) 抬 z=1e-9 → 平面化 CDT 路径 + 非平面回归。
+static void test9()
+{
+  auto r = poly_split::split_polygons<K>(
+    { { P(0,0,0), P(3,0,0), P(3,3,0), P(0,3,0), P(0,2.5,0),
+        P(2.5,2.5,1e-9), P(2.5,0.5,0), P(0,0.5,0) } },
+    make_wall_splitter(1));
+  report("test9 C-shape octagon with noise", r);
+  CHECK(r.pieces.size() == 3, "应得 3 片(左下/右侧连通/左上)");
+  check_rings({
+    { P2(0,0), P2(1,0), P2(1,0.5), P2(0,0.5) },                              // 左下
+    { P2(1,0), P2(3,0), P2(3,3), P2(1,3), P2(1,2.5),                         // 右侧连通
+      P2(2.5,2.5), P2(2.5,0.5), P2(1,0.5) },
+    { P2(0,2.5), P2(1,2.5), P2(1,3), P2(0,3) },                              // 左上
+  }, r.pieces, /*tol=*/1e-7);
+  std::size_t src0 = 0;
+  for (const auto& pc : r.pieces) if (pc.source == 0) ++src0;
+  CHECK(src0 == 3, "三片来源都应为 0");
+}
+
+// ── 测试 10:环上重复连续顶点(PMP 路径会静默不三角化)───────────────────
+// 与测试 8 同一 L,但 (0.7,1) 重复两次:管线去重后与平面版完全一致。
+static void test10()
+{
+  auto r = poly_split::split_polygons<K>(
+    { { P(0,0,0), P(2,0,0), P(2,1,0), P(0.7,1,0), P(0.7,1,0), P(0.7,2,0), P(0,2,0) } },
+    make_wall_splitter(1));
+  report("test10 ring with duplicated consecutive vertex", r);
+  CHECK(r.pieces.size() == 2, "应得 2 片(与测试 8 平面版一致)");
+  check_rings({
+    { P2(1,0), P2(2,0), P2(2,1), P2(1,1) },
+    { P2(1,0), P2(1,1), P2(0.7,1), P2(0.7,2), P2(0,2), P2(0,0) },
+  }, r.pieces);
+}
+
 // ── 测试 0(临时):裸 split,不带 visitor/属性映射 —— 二分定位崩溃来源 ──
 static void test0_raw()
 {
@@ -397,6 +468,9 @@ int main()
   test5(); std::cout << "\n";
   test6(); std::cout << "\n";
   test7(); std::cout << "\n";
+  test8(); std::cout << "\n";
+  test9(); std::cout << "\n";
+  test10(); std::cout << "\n";
 
   std::cout << g_checks << " checks, " << g_failures << " failures\n";
   return g_failures == 0 ? 0 : 1;

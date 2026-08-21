@@ -3,3 +3,7 @@ build/
 
 # 调试 OBJ 导出(环境变量 POLYGON3SPLIT_DEBUG_DIR 指定目录)
 debug_obj/
+# 复现程序构建产物
+.repro/build/
+# 复现程序 OBJ 导出
+out/

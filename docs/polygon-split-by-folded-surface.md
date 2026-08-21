@@ -35,8 +35,10 @@
 多边形(单/批/相邻共边)──① add_face──▶ mesh(每个原始面 = 一个多边形)
                                      │
                                      ├──② 来源标记 + 三角化:
-                                     │      先给每个原始面写面号(= 多边形号),
-                                     │      再带 visitor 调 triangulate_faces
+                                     │      ≥5 顶点面先走 triangulate_polygon_faces
+                                     │      (Newell 法向投影 + 精确 2D CDT,去重复点),
+                                     │      逐组写面号(= 多边形号),
+                                     │      再带 visitor 调 triangulate_faces 收尾 quad
                                      │      —— 每个新三角形继承所在原始面的标记
                                      │      (不能用连通分量记来源:相邻多边形共边,
                                      │        会并成一个分量,来源信息丢失)
@@ -86,6 +88,11 @@
 - **标记流程**:三角化**前**给每个原始面写自己的面号(= 多边形号,插入序);visitor 在 `before_subface_creations(f_old)` 记录、`after_subface_created(f_new)` 继承 → 每个三角形知道自己来自哪个多边形。
 - **与 corefine visitor 的差别**:triangulate_faces 只作用于单一网格、钩子**无** mesh 参数 → 无需 watch 守卫。visitor 同样被按值拷贝(triangulate_faces.h:430-431),`Surface_mesh::Property_map` 共享存储,安全。**[已验证]**
 - **对角线交点(实测补充)**:三角化引入的对角线若与切线相交(如正方形对角线交 x=1 于 (1,1)),交点会成为网格顶点,并作为**共线冗余点**出现在片的边界环上(测试 1/5/6 实测:(1,1)、(1,0.5)、(0.5,0.5) 等)。它不影响片的多边形语义;下游要"纯角点环"时需做共线归一化(测试已采用,剥掉与前后邻点共线的顶点)。**[已测试]**
+- **≥5 顶点面必须先走 `triangulate_polygon_faces`(实测补丁,第二版)**:直接把 ≥5 顶点面交给 `PMP::triangulate_faces` 会走洞填充路径(triangulate_faces.h:328 → `triangulate_hole_polyline`,平面 CDT 子路径 → 失败即**静默**回退 3D Delaunay 洞填充)。实测两处坑(复现程序 19 用例扫描 + 闸门逐项定位):
+  1. **共面闸门容差拿 bbox 的 z 跨度当基准**:triangulate_hole.h:769-771 取 `vertex(0)`-`vertex(5)` 平方距离/16,而 CGAL 6.2 的 `Iso_cuboid_3` 顶点序里这两点**仅差 z**。近似水平的多边形(z 跨度≈0,平面数据最常见形态)容差≈0:EPECK 下哪怕 1e-17 的不共面都被拒 → 静默回退 DT3。DT3 是给曲面洞补片设计的最小二面角搜索,在近平面点集上三角形质量失控(对角线乱穿,即用户看到的"乱七八糟"),大环还是 O(n³)。
+  2. **环上连续重复顶点**会让 `triangulate_faces` 静默不三角化(面保持 n-gon 进 split,未定义行为)。
+
+  修复:`triangulate_polygon_faces`(split_polygons.h)对每个 ≥5 顶点面(先去连续重复点)以 **Newell 法向**(Σ p_i × p_{i+1},精确)投影,建精确 2D 约束 Delaunay(`Projection_traits_3` + `Constrained_Delaunay_triangulation_2`,PMP 平面子路径同款机制但**无共面闸门**),三角形朝向与环一致,恰 n−2 片;整网格重建(逐顶点复制,共享边照常缝合),返回按原始面分组的三角形组(② 的标记直接逐组写)。3/4 顶点面仍交 PMP(quad 路径纯精确算术、无平面性前提)。任一环退化 → 返回空且网格不动,管线转 `std::invalid_argument`。**[已测试]**(测试 8/9/10:非平面 L 六边形 z=1e-9、带噪声强非凸 C 形八边形、重复连续顶点环;复现程序 19/19 通过,visitor 钩子确认 ≥5 面不再触发 PMP 洞填充)
 
 ### ②′ 为什么不能用连通分量记来源(设计约束)
 
@@ -224,9 +231,13 @@ struct Tag_propagator : PMP::Corefinement::Default_visitor<TriangleMesh>
 template <class K>
 Split_result<K> split_mesh(Polygon_mesh<K> tm, const Polygon_mesh<K>& splitter)
 {
-  // ② 来源标记 + 三角化:原始面写面号(= 多边形号),visitor 让新三角形继承
+  // ② 来源标记 + 三角化:≥5 顶点面先走 triangulate_polygon_faces(§3② 补丁,
+  //    Newell 投影 + 精确 2D CDT,去重复点;返回按原始面分组的三角形),
+  //    逐组写面号(= 多边形号);再带 visitor 调 PMP 收尾 quad,新三角形继承标记
+  auto groups = triangulate_polygon_faces<K>(tm);   // 空 = 有环退化,抛异常
   auto fid = tm.add_property_map<Mesh::Face_index, int>("f:source", -1).first;
-  { std::size_t i = 0; for (auto f : faces(tm)) put(fid, f, int(i++)); }
+  for (std::size_t k = 0; k < groups.size(); ++k)
+    for (auto f : groups[k]) put(fid, f, int(k));
   PMP::triangulate_faces(tm,
       PMP::parameters::visitor(Tri_source_tagger<decltype(fid), Mesh>(fid)));
 
@@ -254,9 +265,9 @@ Split_result<K> split_mesh(Polygon_mesh<K> tm, const Polygon_mesh<K>& splitter)
 } // namespace poly_split
 ```
 
-## 8. 测试计划与结果(2026-08-20 全部通过)
+## 8. 测试计划与结果(2026-08-21 全部通过)
 
-测试程序 [tests/split_test.cpp](../tests/split_test.cpp):`split_polygons`/`split_mesh` 六切割用例 + 前置体检用例 + 环比较(共线归一化 + 旋转/反向匹配)+ 通用校验(unmarked==0、component_count==pieces、is_valid)。**Debug + Release 均 59 项检查 0 失败。**
+测试程序 [tests/split_test.cpp](../tests/split_test.cpp):`split_polygons`/`split_mesh` 六切割用例 + 前置体检用例 + 环比较(共线归一化 + 旋转/反向匹配)+ 通用校验(unmarked==0、component_count==pieces、is_valid)+ ≥5 顶点面三角化回归。**Release 89 项检查 0 失败。**
 
 | # | 用例 | 关键断言(实测值) | 验证点 |
 |---|---|---|---|
@@ -267,8 +278,13 @@ Split_result<K> split_mesh(Polygon_mesh<K> tm, const Polygon_mesh<K>& splitter)
 | 5 | **相邻**两四边形(共享边 y=1)+ 切线 x=1 穿共享边 | **4 片;来源 {0,0,1,1}**;每片环含共享边段;V=16(6+5 交点+5 复制) | 相邻多边形各切成两片;**逐面标记 + barrier 分组**;共享边交点复制 |
 | 6 | **相邻**两方块(共享边 x=1)+ 横墙 y=0.5 同时切两者 | **4 片;来源 {0,0,1,1}**;S1上/S2上 经未切共享边连通仍分作两组,环含该共享边段;V=16(6+5+5) | barrier 隔开同分量内不同多边形;**共享边作为组边界出环** |
 | 7 | 前置体检 preflight | 正常输入(quad tm + 三角墙)0 违规;自交 tm 被抓;共线三角形被抓;quad 放 splitter 位置被抓 | **split 前置违反的预先诊断**(§4ⓢ) |
+| 8 | L 形六边形(≥5 顶点)× 竖墙 x=1:严格平面版 + 凹点 z=1e-9 非平面版 | 各 2 片,环逐点一致(右 4 边形 + 左 6 边形,噪声容差 1e-7) | **非平面 ≥5 边形走平面化 CDT**(§3② 补丁);修复前非平面版会静默回退 DT3 出乱三角形 |
+| 9 | C 形八边形(强非凸,凹点 z=1e-9)× 竖墙 x=1 | 3 片(左下 4 边形 / 右侧连通 8 边形 / 左上 4 边形),来源全 0 | 强非凸 + 噪声;CDT 对角线不穿凹口 |
+| 10 | 测试 8 的 L 六边形 + (0.7,1) 重复两次 | 2 片,环与测试 8 平面版逐点一致 | **连续重复顶点去重**(修复前静默不三角化,UB) |
 
 与初版手算的差异(均已按实测修正):测试 1/4/5 初版顶点数(8/12/11)漏算了**三角化对角线与切线的交点**和**路径内部顶点的复制**;"只复制原边界端点"的推断被测试 1/2/5 推翻(§5-3);"triangulate_faces 无 visitor"与"组边界沿 next 链走"两处初版论断被本次实施推翻(§3②/§3⑥)。
+
+第二版修复(2026-08-21)另附复现程序 `.repro/triang_repro.cpp`:19 用例(凸/非凸/斜面/竖面/共线冗余/重复点/非平面 1e-9~1.0 扫描/V 形弯折/60 边形圆环×2)全过 —— 管线路径成功、三角形数恰 n−2、朝向一致、**精确**矢量面积闭合、无自交;Hole_filling visitor 钩子零触发,证明 ≥5 面完全绕开 PMP 洞填充(含 DT3 回退)。`.repro/gate_probe.cpp` 是定位共面闸门容差来源的逐闸门复刻(bbox 顶点 dump:vertex(0) 与 vertex(5) 仅差 z)。
 
 ### 构建与运行(实际使用,手动 header-only 模式)
 
